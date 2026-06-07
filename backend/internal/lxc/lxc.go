@@ -456,8 +456,20 @@ iface eth0 inet static
 	if isAlpine {
 		interfaces := filepath.Join(rootfsPath, "etc", "network", "interfaces")
 		content := "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n"
+		if staticIPv4 != "" {
+			content = fmt.Sprintf(`auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address %s
+    netmask 255.255.255.0
+    gateway 10.0.3.1
+`, staticIPv4)
+		}
 		_ = os.MkdirAll(filepath.Dir(interfaces), 0755)
 		_ = os.WriteFile(interfaces, []byte(content), 0644)
+		_ = os.WriteFile(filepath.Join(rootfsPath, "etc", "resolv.conf"), []byte("nameserver 10.0.3.1\nnameserver 8.8.8.8\n"), 0644)
 		_ = exec.Command("chroot", rootfsPath, "rc-update", "add", "networking", "boot").Run()
 		return
 	}
