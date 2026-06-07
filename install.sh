@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${CLICD_REPO:-MengMengCode/CLICD}"
+REPO="${CLICD_REPO:-chinahch/CLICD-fixed}"
 CLICD_INSTALL_VERSION="${CLICD_VERSION:-latest}"
 ASSET="clicd-linux-amd64.tar.gz"
 ACTION="${1:-install}"
