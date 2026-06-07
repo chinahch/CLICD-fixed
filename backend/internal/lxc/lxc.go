@@ -14,8 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -385,11 +385,12 @@ func (m *Manager) CreateContainer(cfg ContainerConfig) error {
 	config.AddContainer(container)
 
 	// Pre-configure network and SSH in the rootfs before first boot.
+	staticIPv4 := staticIPv4ForLXCName(lxcName)
 	if err := m.ensureStaticIPv4Config(lxcName); err != nil {
 		fmt.Printf("Warning: failed to configure static IPv4 for %s: %v\n", lxcName, err)
 	}
 	rootfsPath := filepath.Join(m.LxcPath, lxcName, "rootfs")
-	m.preconfigureNetwork(rootfsPath, cfg.TemplateID)
+	m.preconfigureNetwork(rootfsPath, cfg.TemplateID, staticIPv4)
 	if ipv6 != "" {
 		if err := installContainerIPv6Init(rootfsPath, ipv6); err != nil {
 			fmt.Printf("Warning: failed to install IPv6 init in %s: %v\n", lxcName, err)
@@ -415,7 +416,30 @@ func (m *Manager) CreateContainer(cfg ContainerConfig) error {
 	return nil
 }
 
-func (m *Manager) preconfigureNetwork(rootfsPath, templateID string) {
+func (m *Manager) preconfigureNetwork(rootfsPath, templateID string, staticIPv4 string) {
+
+	if staticIPv4 != "" {
+		interfacesPath := filepath.Join(rootfsPath, "etc", "network", "interfaces")
+		_ = os.MkdirAll(filepath.Dir(interfacesPath), 0755)
+
+		interfaces := fmt.Sprintf(`auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address %s
+    netmask 255.255.255.0
+    gateway 10.0.3.1
+`, staticIPv4)
+
+		if err := os.WriteFile(interfacesPath, []byte(interfaces), 0644); err != nil {
+			fmt.Printf("Warning: failed to write static IPv4 interfaces for %s: %v\n", rootfsPath, err)
+		}
+
+		resolvPath := filepath.Join(rootfsPath, "etc", "resolv.conf")
+		_ = os.WriteFile(resolvPath, []byte("nameserver 10.0.3.1\nnameserver 8.8.8.8\n"), 0644)
+	}
+
 	osRelease := ""
 	if data, err := os.ReadFile(filepath.Join(rootfsPath, "etc", "os-release")); err == nil {
 		osRelease = strings.ToLower(string(data))
@@ -475,52 +499,59 @@ IPv6AcceptRA=no
 	}
 }
 
+func staticIPv4ForLXCName(lxcName string) string {
+	id := 0
+	if strings.HasPrefix(lxcName, "ct-") {
+		fmt.Sscanf(lxcName, "ct-%d", &id)
+	}
+	if id <= 0 {
+		return ""
+	}
+
+	last := 100 + (id % 100)
+	if last < 100 {
+		last = 100
+	}
+	if last > 199 {
+		last = 199
+	}
+
+	return fmt.Sprintf("10.0.3.%d", last)
+}
+
 // ensureStaticIPv4Config pins CLICD LXC containers to a stable IPv4 address.
 // It avoids DHCP address changes after container restart, which would break DNAT port mappings.
 // Mapping rule: ct-N -> 10.0.3.(100 + N % 100), so ct-1=10.0.3.101, ct-104=10.0.3.104.
 func (m *Manager) ensureStaticIPv4Config(lxcName string) error {
-configFile := filepath.Join(m.LxcPath, lxcName, "config")
+	configFile := filepath.Join(m.LxcPath, lxcName, "config")
 
-data, err := os.ReadFile(configFile)
-if err != nil {
-return fmt.Errorf("failed to read container config for static IPv4: %v", err)
-}
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return fmt.Errorf("failed to read container config for static IPv4: %v", err)
+	}
 
-id := 0
-if strings.HasPrefix(lxcName, "ct-") {
-fmt.Sscanf(lxcName, "ct-%d", &id)
-}
-if id <= 0 {
-return nil
-}
+	ipv4 := staticIPv4ForLXCName(lxcName)
+	if ipv4 == "" {
+		return nil
+	}
 
-last := 100 + (id % 100)
-if last < 100 {
-last = 100
-}
-if last > 199 {
-last = 199
-}
+	lines := strings.Split(string(data), "\n")
+	next := make([]string, 0, len(lines)+4)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "lxc.net.0.ipv4.address") ||
+			strings.HasPrefix(trimmed, "lxc.net.0.ipv4.gateway") {
+			continue
+		}
+		next = append(next, line)
+	}
 
-ipv4 := fmt.Sprintf("10.0.3.%d", last)
+	next = append(next, "")
+	next = append(next, "# CLICD static IPv4")
+	next = append(next, fmt.Sprintf("lxc.net.0.ipv4.address = %s/24", ipv4))
+	next = append(next, "lxc.net.0.ipv4.gateway = 10.0.3.1")
 
-lines := strings.Split(string(data), "\n")
-next := make([]string, 0, len(lines)+4)
-for _, line := range lines {
-trimmed := strings.TrimSpace(line)
-if strings.HasPrefix(trimmed, "lxc.net.0.ipv4.address") ||
-strings.HasPrefix(trimmed, "lxc.net.0.ipv4.gateway") {
-continue
-}
-next = append(next, line)
-}
-
-next = append(next, "")
-next = append(next, "# CLICD static IPv4")
-next = append(next, fmt.Sprintf("lxc.net.0.ipv4.address = %s/24", ipv4))
-next = append(next, "lxc.net.0.ipv4.gateway = 10.0.3.1")
-
-return os.WriteFile(configFile, []byte(strings.Join(next, "\n")), 0644)
+	return os.WriteFile(configFile, []byte(strings.Join(next, "\n")), 0644)
 }
 
 // preconfigureSSH installs and configures SSH directly in the rootfs before first boot.
@@ -2258,7 +2289,7 @@ func (m *Manager) ReinstallContainer(id int, templateID string) error {
 
 	// Set root password and pre-configure network/SSH via chroot.
 	rootfsPath := filepath.Join(m.LxcPath, lxcName, "rootfs")
-	m.preconfigureNetwork(rootfsPath, templateID)
+	m.preconfigureNetwork(rootfsPath, templateID, staticIPv4ForLXCName(lxcName))
 	if c.IPv6 != "" {
 		if err := installContainerIPv6Init(rootfsPath, c.IPv6); err != nil {
 			fmt.Printf("Warning: failed to install IPv6 init in %s after reinstall: %v\n", lxcName, err)
