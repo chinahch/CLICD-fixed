@@ -385,6 +385,9 @@ func (m *Manager) CreateContainer(cfg ContainerConfig) error {
 	config.AddContainer(container)
 
 	// Pre-configure network and SSH in the rootfs before first boot.
+	if err := m.ensureStaticIPv4Config(lxcName); err != nil {
+		fmt.Printf("Warning: failed to configure static IPv4 for %s: %v\n", lxcName, err)
+	}
 	rootfsPath := filepath.Join(m.LxcPath, lxcName, "rootfs")
 	m.preconfigureNetwork(rootfsPath, cfg.TemplateID)
 	if ipv6 != "" {
@@ -470,6 +473,54 @@ IPv6AcceptRA=no
 	if !isRHELFamily {
 		_ = exec.Command("chroot", rootfsPath, "systemctl", "enable", "systemd-networkd").Run()
 	}
+}
+
+// ensureStaticIPv4Config pins CLICD LXC containers to a stable IPv4 address.
+// It avoids DHCP address changes after container restart, which would break DNAT port mappings.
+// Mapping rule: ct-N -> 10.0.3.(100 + N % 100), so ct-1=10.0.3.101, ct-104=10.0.3.104.
+func (m *Manager) ensureStaticIPv4Config(lxcName string) error {
+configFile := filepath.Join(m.LxcPath, lxcName, "config")
+
+data, err := os.ReadFile(configFile)
+if err != nil {
+return fmt.Errorf("failed to read container config for static IPv4: %v", err)
+}
+
+id := 0
+if strings.HasPrefix(lxcName, "ct-") {
+fmt.Sscanf(lxcName, "ct-%d", &id)
+}
+if id <= 0 {
+return nil
+}
+
+last := 100 + (id % 100)
+if last < 100 {
+last = 100
+}
+if last > 199 {
+last = 199
+}
+
+ipv4 := fmt.Sprintf("10.0.3.%d", last)
+
+lines := strings.Split(string(data), "\n")
+next := make([]string, 0, len(lines)+4)
+for _, line := range lines {
+trimmed := strings.TrimSpace(line)
+if strings.HasPrefix(trimmed, "lxc.net.0.ipv4.address") ||
+strings.HasPrefix(trimmed, "lxc.net.0.ipv4.gateway") {
+continue
+}
+next = append(next, line)
+}
+
+next = append(next, "")
+next = append(next, "# CLICD static IPv4")
+next = append(next, fmt.Sprintf("lxc.net.0.ipv4.address = %s/24", ipv4))
+next = append(next, "lxc.net.0.ipv4.gateway = 10.0.3.1")
+
+return os.WriteFile(configFile, []byte(strings.Join(next, "\n")), 0644)
 }
 
 // preconfigureSSH installs and configures SSH directly in the rootfs before first boot.
