@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"sync"
 	"time"
 
@@ -1001,15 +1002,20 @@ func (m *Manager) shiftRootfsForUnprivileged(lxcName string) error {
 		return nil
 	}
 	m.unmountRootfsChildMounts(rootfsPath)
+	var rootDev uint64
 	rootInfo, err := os.Lstat(rootfsPath)
 	if err != nil {
-		return err
+		fmt.Printf("Warning: failed to stat rootfs %s before ownership shift: %v; continuing without cross-device guard\n", rootfsPath, err)
+	} else {
+		switch rootStat := rootInfo.Sys().(type) {
+		case *unix.Stat_t:
+			rootDev = uint64(rootStat.Dev)
+		case *syscall.Stat_t:
+			rootDev = uint64(rootStat.Dev)
+		default:
+			fmt.Printf("Warning: failed to read rootfs device for %s; continuing without cross-device guard\n", rootfsPath)
+		}
 	}
-	rootStat, ok := rootInfo.Sys().(*unix.Stat_t)
-	if !ok {
-		return fmt.Errorf("failed to read rootfs device for %s", rootfsPath)
-	}
-	rootDev := rootStat.Dev
 
 	if err := filepath.WalkDir(rootfsPath, func(path string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1019,18 +1025,31 @@ func (m *Manager) shiftRootfsForUnprivileged(lxcName string) error {
 		if err != nil {
 			return err
 		}
-		stat, ok := info.Sys().(*unix.Stat_t)
-		if !ok {
-			return fmt.Errorf("failed to read uid/gid for %s", path)
+		var pathDev uint64
+		var uid int
+		var gid int
+		switch stat := info.Sys().(type) {
+		case *unix.Stat_t:
+			pathDev = uint64(stat.Dev)
+			uid = int(stat.Uid)
+			gid = int(stat.Gid)
+		case *syscall.Stat_t:
+			pathDev = uint64(stat.Dev)
+			uid = int(stat.Uid)
+			gid = int(stat.Gid)
+		default:
+			fmt.Printf("Warning: failed to read uid/gid for %s; skipping ownership shift for this path\n", path)
+			if info.IsDir() && path != rootfsPath {
+				return filepath.SkipDir
+			}
+			return nil
 		}
-		if path != rootfsPath && stat.Dev != rootDev {
+		if rootDev != 0 && path != rootfsPath && pathDev != rootDev {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		uid := int(stat.Uid)
-		gid := int(stat.Gid)
 		if uid >= uidBase && uid < uidBase+65536 && gid >= gidBase && gid < gidBase+65536 {
 			return nil
 		}
