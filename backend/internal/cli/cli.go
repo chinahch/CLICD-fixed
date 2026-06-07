@@ -31,7 +31,7 @@ func Run() {
 		}
 		clearScreen()
 		printMenu()
-		fmt.Print("\n请选择操作 [1-12,0/q]: ")
+		fmt.Print("\n请选择操作 [1-13,0/q]: ")
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 
@@ -84,6 +84,8 @@ func Run() {
 			clearScreen()
 			cliUninstall(reader)
 			return
+		case "13":
+			manageSwapInteractive(reader)
 		case "0":
 			clearScreen()
 			cliShowInfo()
@@ -127,6 +129,7 @@ func printMenu() {
 	fmt.Println("  10. 导入现有 LXC 容器")
 	fmt.Println("  11. 检查并升级 CLICD")
 	fmt.Println("  12. 卸载 CLICD")
+	fmt.Println("  13. 小鸡交换内存管理")
 	fmt.Println("  0. 系统信息")
 	fmt.Println("  q. 退出")
 }
@@ -1161,4 +1164,311 @@ func promptPortList(reader *bufio.Reader, label string) []int {
 		ports = append(ports, value)
 	}
 	return ports
+}
+
+func manageSwapInteractive(reader *bufio.Reader) {
+	for {
+		fmt.Println("\n--- 小鸡交换内存管理 ---")
+		fmt.Println("说明：LXC 容器内不能自己 swapon，swap 由宿主机提供，通过 cgroup 限制。")
+		fmt.Println("大小示例：512M / 1G / 0 / max")
+		fmt.Println("  1. 查看所有小鸡内存/swap 限制")
+		fmt.Println("  2. 设置指定小鸡 swap 大小")
+		fmt.Println("  3. 取消指定小鸡 swap 限制(max)")
+		fmt.Println("  4. 禁用指定小鸡 swap(0)")
+		fmt.Println("  0. 返回")
+		choice := promptString(reader, "请选择操作", "0")
+
+		switch strings.ToLower(strings.TrimSpace(choice)) {
+		case "1":
+			listLXCSwapLimits()
+		case "2":
+			name := promptString(reader, "请输入小鸡名称或编号，例如 ct-5 或 5", "")
+			if name == "" {
+				fmt.Println("未输入小鸡名称。")
+				continue
+			}
+			size := promptString(reader, "请输入 swap 大小，例如 512M / 1G / 0 / max", "512M")
+			setLXCSwapLimitInteractive(reader, name, size)
+		case "3":
+			name := promptString(reader, "请输入小鸡名称或编号，例如 ct-5 或 5", "")
+			if name == "" {
+				fmt.Println("未输入小鸡名称。")
+				continue
+			}
+			setLXCSwapLimitInteractive(reader, name, "max")
+		case "4":
+			name := promptString(reader, "请输入小鸡名称或编号，例如 ct-5 或 5", "")
+			if name == "" {
+				fmt.Println("未输入小鸡名称。")
+				continue
+			}
+			setLXCSwapLimitInteractive(reader, name, "0")
+		case "0", "q":
+			return
+		default:
+			fmt.Println("无效选择。")
+		}
+	}
+}
+
+func normalizeLXCName(input string) string {
+	name := strings.TrimSpace(input)
+	if name == "" {
+		return ""
+	}
+	if _, err := strconv.Atoi(name); err == nil {
+		name = "ct-" + name
+	}
+	return name
+}
+
+func lxcConfigPath(name string) string {
+	return filepath.Join("/var/lib/lxc", name, "config")
+}
+
+func listLXCSwapLimits() {
+	base := "/var/lib/lxc"
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		fmt.Printf("读取 %s 失败: %v\n", base, err)
+		return
+	}
+
+	fmt.Println("\n小鸡 swap 限制：")
+	fmt.Println("————————————————————————————————————————————————————————")
+	fmt.Printf(" %-12s %-10s %-14s %-14s %-14s\n", "名称", "状态", "内存限制", "Swap限制", "Swap当前")
+	fmt.Println("————————————————————————————————————————————————————————")
+
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "ct-") {
+			continue
+		}
+		cfg := filepath.Join(base, name, "config")
+		if _, err := os.Stat(cfg); err != nil {
+			continue
+		}
+
+		memMax := readLXCConfigValue(cfg, "lxc.cgroup2.memory.max")
+		swapMax := readLXCConfigValue(cfg, "lxc.cgroup2.memory.swap.max")
+		if memMax == "" {
+			memMax = "-"
+		}
+		if swapMax == "" {
+			swapMax = "max"
+		}
+
+		status := "stopped"
+		if isLXCRunning(name) {
+			status = "running"
+		}
+
+		swapCurrent := "-"
+		if v := readCgroupValue(name, "memory.swap.current"); v != "" {
+			swapCurrent = v
+		}
+
+		fmt.Printf(" %-12s %-10s %-14s %-14s %-14s\n",
+			name,
+			status,
+			formatMaybeBytes(memMax),
+			formatMaybeBytes(swapMax),
+			formatMaybeBytes(swapCurrent),
+		)
+		count++
+	}
+
+	if count == 0 {
+		fmt.Println("没有发现 ct-* 小鸡。")
+	}
+	fmt.Println("————————————————————————————————————————————————————————")
+}
+
+func setLXCSwapLimitInteractive(reader *bufio.Reader, inputName string, sizeInput string) {
+	name := normalizeLXCName(inputName)
+	if name == "" {
+		fmt.Println("小鸡名称为空。")
+		return
+	}
+
+	cfg := lxcConfigPath(name)
+	if _, err := os.Stat(cfg); err != nil {
+		fmt.Printf("小鸡配置不存在: %s\n", cfg)
+		return
+	}
+
+	value, label, err := parseSwapLimitValue(sizeInput)
+	if err != nil {
+		fmt.Printf("swap 大小无效: %v\n", err)
+		return
+	}
+
+	wasRunning := isLXCRunning(name)
+	if wasRunning {
+		fmt.Printf("小鸡 %s 当前运行中。修改 swap 限制需要重启小鸡才能完全生效。\n", name)
+		confirm := promptString(reader, "是否现在停止并重启该小鸡？输入 yes 继续", "yes")
+		if strings.ToLower(strings.TrimSpace(confirm)) != "yes" {
+			fmt.Println("已取消。")
+			return
+		}
+		_ = exec.Command("lxc-stop", "-n", name).Run()
+	}
+
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		fmt.Printf("读取配置失败: %v\n", err)
+		return
+	}
+
+	backup := fmt.Sprintf("%s.bak.swap.%s", cfg, time.Now().Format("20060102-150405"))
+	_ = os.WriteFile(backup, data, 0644)
+
+	lines := strings.Split(string(data), "\n")
+	next := make([]string, 0, len(lines)+4)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "lxc.cgroup2.memory.swap.max") {
+			continue
+		}
+		next = append(next, line)
+	}
+
+	next = append(next, "")
+	next = append(next, "# CLICD custom swap limit")
+	next = append(next, "lxc.cgroup2.memory.swap.max = "+value)
+
+	if err := os.WriteFile(cfg, []byte(strings.Join(next, "\n")), 0644); err != nil {
+		fmt.Printf("写入配置失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✅ 已设置 %s swap 限制为 %s\n", name, label)
+	fmt.Printf("备份文件: %s\n", backup)
+
+	if wasRunning {
+		if err := exec.Command("lxc-start", "-n", name, "-d").Run(); err != nil {
+			fmt.Printf("启动小鸡失败，请手动执行 lxc-start -n %s -d: %v\n", name, err)
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	fmt.Println("\n当前限制：")
+	fmt.Printf("memory.max:      %s\n", formatMaybeBytes(readCgroupValue(name, "memory.max")))
+	fmt.Printf("memory.swap.max: %s\n", formatMaybeBytes(readCgroupValue(name, "memory.swap.max")))
+	fmt.Printf("swap.current:    %s\n", formatMaybeBytes(readCgroupValue(name, "memory.swap.current")))
+}
+
+func parseSwapLimitValue(input string) (string, string, error) {
+	s := strings.TrimSpace(strings.ToLower(input))
+	if s == "" {
+		return "", "", fmt.Errorf("不能为空")
+	}
+	if s == "max" || s == "unlimited" || s == "不限" {
+		return "max", "不限(max)", nil
+	}
+	if s == "0" || s == "off" || s == "disable" || s == "disabled" || s == "禁用" {
+		return "0", "0(禁用)", nil
+	}
+
+	multiplier := float64(1)
+	unit := ""
+	last := s[len(s)-1]
+	if last == 'k' || last == 'm' || last == 'g' {
+		unit = string(last)
+		s = strings.TrimSpace(s[:len(s)-1])
+		switch unit {
+		case "k":
+			multiplier = 1024
+		case "m":
+			multiplier = 1024 * 1024
+		case "g":
+			multiplier = 1024 * 1024 * 1024
+		}
+	}
+
+	num, err := strconv.ParseFloat(s, 64)
+	if err != nil || num < 0 {
+		return "", "", fmt.Errorf("请输入 512M、1G、0 或 max")
+	}
+
+	bytes := int64(num * multiplier)
+	if bytes < 0 {
+		return "", "", fmt.Errorf("数值异常")
+	}
+
+	return fmt.Sprintf("%d", bytes), formatBytes(bytes), nil
+}
+
+func readLXCConfigValue(configPath string, key string) string {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, key+" ") || strings.HasPrefix(trimmed, key+"=") {
+			parts := strings.SplitN(trimmed, "=", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+func isLXCRunning(name string) bool {
+	out, err := exec.Command("lxc-info", "-n", name, "-s").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), "running")
+}
+
+func readCgroupValue(name string, file string) string {
+	paths := []string{
+		filepath.Join("/sys/fs/cgroup", "lxc.payload."+name, file),
+		filepath.Join("/sys/fs/cgroup", "system.slice", "lxc@"+name+".service", file),
+	}
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	return ""
+}
+
+func formatMaybeBytes(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "-"
+	}
+	if v == "max" {
+		return "max"
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return v
+	}
+	return formatBytes(n)
+}
+
+func formatBytes(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%dB", n)
+	}
+	kb := float64(n) / 1024
+	if kb < 1024 {
+		return fmt.Sprintf("%.0fK", kb)
+	}
+	mb := kb / 1024
+	if mb < 1024 {
+		return fmt.Sprintf("%.0fM", mb)
+	}
+	gb := mb / 1024
+	return fmt.Sprintf("%.2fG", gb)
 }
